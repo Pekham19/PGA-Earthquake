@@ -1,0 +1,316 @@
+# pga_ml_forecasts_memory_safe.py
+import os, math, warnings
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import rasterio
+from rasterio.transform import from_origin
+
+warnings.filterwarnings("ignore")
+
+# ================== CONFIG ==================
+CATALOG_CSV   = r"D:Earthquake_datasets.csv"
+OUT_DIR       = r"D:/Earthquake_Project/pga_outputs"
+GRID_STEP_DEG = 1.0
+MIN_MAG       = 4.5
+MAX_DIST_KM   = 300.0
+YEARS_RANGE   = (1950, 2025)
+FORECAST_YEARS= [2030, 2050, 2100]
+LAGS          = 5          # set to 3 if RAM is still an issue
+SEED          = 42
+C0, C1, C2, H = -1.5, 0.9, 1.1, 10.0     # GMPE-like proxy
+ACTIVE_CUTOFF = 1e-6       # keep cells whose HIST max PGA > this
+# ============================================
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    d2r = np.pi / 180.0
+    f1, f2 = lat1*d2r, lat2*d2r
+    dlat = (lat2-lat1)*d2r
+    dlon = (lon2-lon1)*d2r
+    a = np.sin(dlat/2)**2 + np.cos(f1)*np.cos(f2)*np.sin(dlon/2)**2
+    return 6371.0 * 2*np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+
+def pga_proxy(Mw, R_hyp_km):
+    ln_pga = C0 + C1*Mw - C2*np.log(R_hyp_km + H)
+    return np.exp(ln_pga)
+
+def write_geotiff(path, arr2d, lats, lons, dtype="float32"):
+    res_x = lons[1]-lons[0]
+    res_y = lats[1]-lats[0]
+    transform = from_origin(lons.min()-res_x/2, lats.max()+res_y/2, res_x, res_y)
+    with rasterio.open(path, "w", driver="GTiff",
+                       height=arr2d.shape[0], width=arr2d.shape[1],
+                       count=1, dtype=dtype, crs="EPSG:4326",
+                       transform=transform, compress="lzw") as dst:
+        dst.write(np.flipud(arr2d.astype(dtype)), 1)
+
+def array_to_csv(path, arr2d, lats, lons, colname="pga_g"):
+    LAT, LON = np.meshgrid(lats, lons, indexing="ij")
+    pd.DataFrame({"lat": LAT.ravel(), "lon": LON.ravel(), colname: arr2d.ravel()}).to_csv(path, index=False)
+
+def evaluate(y_true, y_pred, name):
+    y_true = y_true.astype(np.float32); y_pred = y_pred.astype(np.float32)
+    mae  = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2   = r2_score(y_true, y_pred)
+    print(f"{name} -> MAE: {mae:.6f} | RMSE: {rmse:.6f} | R²: {r2:.4f}")
+    return {"model": name, "MAE": mae, "RMSE": rmse, "R2": r2}
+
+# 1) Load catalog
+eq = pd.read_csv(CATALOG_CSV)
+eq.columns = [c.strip().lower() for c in eq.columns]
+for col in ["time","latitude","longitude","depth","mag"]:
+    if col not in eq.columns: raise ValueError(f"Missing column: {col}")
+eq["time"] = pd.to_datetime(eq["time"], errors="coerce")
+eq = eq.dropna(subset=["time","latitude","longitude","depth","mag"])
+eq = eq[(eq["time"].dt.year >= YEARS_RANGE[0]) & (eq["time"].dt.year <= YEARS_RANGE[1])]
+eq = eq[eq["mag"] >= MIN_MAG].copy()
+eq["year"] = eq["time"].dt.year.astype(int)
+print(f"Events used: {len(eq):,}")
+
+# 2) Grid
+lats = np.arange(-90 + GRID_STEP_DEG/2, 90, GRID_STEP_DEG)
+lons = np.arange(-180 + GRID_STEP_DEG/2, 180, GRID_STEP_DEG)
+nlat, nlon = len(lats), len(lons)
+years = np.arange(YEARS_RANGE[0], YEARS_RANGE[1]+1, dtype=int)
+ny = len(years)
+year_to_idx = {y:i for i,y in enumerate(years)}
+print(f"Grid: {nlat} x {nlon} cells")
+
+lat_bins = np.floor(lats).astype(int)
+lon_bins = np.floor(lons).astype(int)
+bin_index = {}
+for i, la in enumerate(lat_bins):
+    for j, lo in enumerate(lon_bins):
+        bin_index.setdefault((la, lo), []).append((i, j))
+
+# 3) Annual max PGA per cell
+pga_year = np.zeros((ny, nlat, nlon), dtype=np.float32)
+ddeg = MAX_DIST_KM / 111.0
+for _, ev in eq.iterrows():
+    y = int(ev["year"]); iy = year_to_idx[y]
+    ev_lat, ev_lon = float(ev["latitude"]), float(ev["longitude"])
+    dep = max(0.0, float(ev["depth"])); Mw = float(ev["mag"])
+    lat_lo = math.floor(ev_lat - ddeg); lat_hi = math.floor(ev_lat + ddeg)
+    lon_lo = math.floor(ev_lon - ddeg); lon_hi = math.floor(ev_lon + ddeg)
+    cand = []
+    for la in range(lat_lo, lat_hi+1):
+        for lo in range(lon_lo, lon_hi+1):
+            if (la, lo) in bin_index:
+                cand.extend(bin_index[(la, lo)])
+    if not cand: continue
+    ci, cj = zip(*cand)
+    ci = np.array(ci); cj = np.array(cj)
+    dist = haversine_km(ev_lat, ev_lon, lats[ci], lons[cj])
+    mask = dist <= MAX_DIST_KM
+    if not np.any(mask): continue
+    ci = ci[mask]; cj = cj[mask]
+    R_hyp = np.sqrt(dist[mask]**2 + dep**2)
+    pga_v = pga_proxy(Mw, R_hyp).astype(np.float32)
+    pga_year[iy, ci, cj] = np.maximum(pga_year[iy, ci, cj], pga_v)
+
+# Historical base & active mask
+hist_max = np.nanmax(pga_year, axis=0).astype(np.float32)
+write_geotiff(os.path.join(OUT_DIR, "PGA_hist_max_1950_2025.tif"), hist_max, lats, lons)
+array_to_csv(os.path.join(OUT_DIR, "PGA_hist_max_1950_2025.csv"), hist_max, lats, lons)
+
+active_mask = hist_max > ACTIVE_CUTOFF   # << keep only active cells for ML
+print("Active cells:", int(active_mask.sum()), "of", nlat*nlon)
+
+# 4) Long format + lags (active cells only)
+rows = []
+LAT, LON = np.meshgrid(lats, lons, indexing="ij")
+for yi, y in enumerate(years):
+    arr = pga_year[yi]
+    arr = np.where(active_mask, arr, np.nan)
+    rows.append(pd.DataFrame({
+        "year": y,
+        "lat": LAT.ravel(),
+        "lon": LON.ravel(),
+        "pga_g": arr.ravel()
+    }))
+long_df = pd.concat(rows, ignore_index=True).dropna(subset=["pga_g"])
+
+long_df = long_df.sort_values(["lat","lon","year"])
+for k in range(1, LAGS+1):
+    long_df[f"pga_lag{k}"] = long_df.groupby(["lat","lon"])["pga_g"].shift(k)
+ml_df = long_df.dropna().reset_index(drop=True)
+
+# 5) Time-aware split
+train = ml_df[ml_df["year"] <= 2015].copy()
+valid = ml_df[(ml_df["year"] > 2015) & (ml_df["year"] <= 2025)].copy()
+
+FEATURES = [f"pga_lag{k}" for k in range(1, LAGS+1)] + ["lat","lon","year"]
+TARGET   = "pga_g"
+
+# Downcast to float32 to cut memory
+X_tr = train[FEATURES].astype(np.float32).values
+y_tr = train[TARGET].astype(np.float32).values
+X_va = valid[FEATURES].astype(np.float32).values
+y_va = valid[TARGET].astype(np.float32).values
+
+metrics_rows = []
+
+# 6) Random Forest (memory-safe settings)
+rf = RandomForestRegressor(
+    n_estimators=150,
+    max_depth=12,
+    max_features=0.6,
+    min_samples_split=4,
+    min_samples_leaf=2,
+    bootstrap=True,
+    max_samples=0.6,
+    random_state=SEED,
+    n_jobs=1   # limit parallel memory spikes
+)
+rf.fit(X_tr, y_tr)
+pred_va_rf = rf.predict(X_va).astype(np.float32)
+metrics_rows.append(evaluate(y_va, pred_va_rf, "RandomForest"))
+
+# 7) XGBoost (optional)
+xgb_available = True
+try:
+    from xgboost import XGBRegressor
+    xgb = XGBRegressor(
+        n_estimators=400,
+        learning_rate=0.05,
+        max_depth=8,
+        subsample=0.7,
+        colsample_bytree=0.7,
+        reg_lambda=1.0,
+        tree_method="hist",
+        max_bin=64,
+        random_state=SEED,
+        objective="reg:squarederror",
+        n_jobs=1
+    )
+    xgb.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+    pred_va_xgb = xgb.predict(X_va).astype(np.float32)
+    metrics_rows.append(evaluate(y_va, pred_va_xgb, "XGBoost"))
+except Exception as e:
+    xgb_available = False
+    print("XGBoost not available, skipping. Reason:", e)
+
+# 8) Forecast helper (RF/XGB)
+def roll_forecast(model, start_year=2025, target_years=FORECAST_YEARS):
+    # buffers for active cells only
+    last = long_df[long_df["year"]<=start_year].sort_values(["lat","lon","year"])
+    buff = last.groupby(["lat","lon"])["pga_g"].apply(lambda s: list(s.tail(LAGS))).to_dict()
+
+    preds = {}
+    for yr in sorted(target_years):
+        for y in range(start_year+1, yr+1):
+            feats_rows, idx_rows = [], []
+            for (lat,lon), tail in buff.items():
+                if len(tail) < LAGS: continue
+                row = {f"pga_lag{k}": tail[-k] for k in range(1, LAGS+1)}
+                row.update({"lat":lat, "lon":lon, "year":y})
+                feats_rows.append(row); idx_rows.append((lat,lon))
+            if not feats_rows: break
+            F = pd.DataFrame(feats_rows)[FEATURES].astype(np.float32).values
+            yhat = model.predict(F).astype(np.float32)
+            for (lat,lon), val in zip(idx_rows, yhat):
+                tail = buff[(lat,lon)]
+                tail.append(float(val))
+                if len(tail) > LAGS: tail.pop(0)
+        # build full grid (inactive cells NaN)
+        grid = np.full((len(lats), len(lons)), np.nan, dtype=np.float32)
+        for (lat,lon), tail in buff.items():
+            i = np.where(lats==lat)[0]; j = np.where(lons==lon)[0]
+            if i.size and j.size: grid[i[0], j[0]] = tail[-1]
+        preds[yr] = grid
+    return preds
+
+rf_fc  = roll_forecast(rf)
+for yr, grid in rf_fc.items():
+    write_geotiff(os.path.join(OUT_DIR, f"PGA_RF_{yr}.tif"), grid, lats, lons)
+    array_to_csv(os.path.join(OUT_DIR, f"PGA_RF_{yr}.csv"), grid, lats, lons)
+
+if xgb_available:
+    xgb_fc = roll_forecast(xgb)
+    for yr, grid in xgb_fc.items():
+        write_geotiff(os.path.join(OUT_DIR, f"PGA_XGB_{yr}.tif"), grid, lats, lons)
+        array_to_csv(os.path.join(OUT_DIR, f"PGA_XGB_{yr}.csv"), grid, lats, lons)
+
+# 9) LSTM (optional, compact)
+lstm_available = True
+try:
+    import tensorflow as tf
+    from tensorflow.keras import layers, models
+
+    # sequences for active cells only
+    seqs_X_tr, seqs_y_tr = [], []
+    seqs_X_va, seqs_y_va = [], []
+    for (lat,lon), grp in long_df.groupby(["lat","lon"]):
+        g = grp.sort_values("year")
+        vals = g["pga_g"].values.astype("float32")
+        yrs  = g["year"].values
+        if len(vals) < (LAGS+1): continue
+        for t in range(LAGS, len(vals)):
+            seq = vals[t-LAGS:t]
+            target = vals[t]
+            if yrs[t] <= 2015:
+                seqs_X_tr.append(seq); seqs_y_tr.append(target)
+            elif 2016 <= yrs[t] <= 2025:
+                seqs_X_va.append(seq); seqs_y_va.append(target)
+
+    if len(seqs_X_tr) and len(seqs_X_va):
+        X_tr_seq = np.array(seqs_X_tr, dtype=np.float32)[:, :, None]
+        y_tr_seq = np.array(seqs_y_tr, dtype=np.float32)
+        X_va_seq = np.array(seqs_X_va, dtype=np.float32)[:, :, None]
+        y_va_seq = np.array(seqs_y_va, dtype=np.float32)
+
+        model = models.Sequential([
+            layers.Input(shape=(LAGS,1)),
+            layers.LSTM(48, return_sequences=False),  # smaller than before
+            layers.Dense(1)
+        ])
+        model.compile(optimizer="adam", loss="mae")
+        model.fit(X_tr_seq, y_tr_seq, epochs=5, batch_size=512, verbose=1)
+
+        lstm_pred_va = model.predict(X_va_seq, verbose=0).ravel().astype(np.float32)
+        metrics_rows.append(evaluate(y_va_seq, lstm_pred_va, "LSTM"))
+
+        # rolling forecast for active cells only
+        lstm_state = {}
+        for (lat,lon), grp in long_df.groupby(["lat","lon"]):
+            g = grp.sort_values("year")
+            vals = g[g["year"]<=2025]["pga_g"].values.astype("float32")
+            if len(vals) < LAGS: continue
+            lstm_state[(lat,lon)] = list(vals[-LAGS:])
+
+        lstm_fc_grids = {yr: np.full((len(lats), len(lons)), np.nan, dtype=np.float32) for yr in FORECAST_YEARS}
+        for yr in sorted(FORECAST_YEARS):
+            for step in range(2026, yr+1):
+                for (lat,lon), tail in lstm_state.items():
+                    x = np.array(tail, dtype=np.float32)[None, :, None]
+                    yhat = float(model.predict(x, verbose=0)[0,0])
+                    tail.append(yhat)
+                    if len(tail) > LAGS: tail.pop(0)
+            for (lat,lon), tail in lstm_state.items():
+                i = np.where(lats==lat)[0]; j = np.where(lons==lon)[0]
+                if i.size and j.size: lstm_fc_grids[yr][i[0], j[0]] = tail[-1]
+
+        for yr, grid in lstm_fc_grids.items():
+            write_geotiff(os.path.join(OUT_DIR, f"PGA_LSTM_{yr}.tif"), grid, lats, lons)
+            array_to_csv(os.path.join(OUT_DIR, f"PGA_LSTM_{yr}.csv"), grid, lats, lons)
+    else:
+        print("Not enough sequences for LSTM; skipping.")
+except Exception as e:
+    lstm_available = False
+    print("LSTM step skipped. Reason:", e)
+
+# 10) Save metrics
+metrics_df = pd.DataFrame(metrics_rows)
+metrics_path = os.path.join(OUT_DIR, "model_metrics_validation_2016_2025.csv")
+metrics_df.to_csv(metrics_path, index=False)
+
+print("\nSaved metrics to:", metrics_path)
+print("Forecast files saved in:", OUT_DIR)
+print("Expected outputs include:")
+print("  - PGA_RF_{2030,2050,2100}.tif / .csv")
+print("  - PGA_XGB_{2030,2050,2100}.tif / .csv (if xgboost installed)")
+print("  - PGA_LSTM_{2030,2050,2100}.tif / .csv (if tensorflow installed)")

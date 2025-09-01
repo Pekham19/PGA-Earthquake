@@ -1,0 +1,142 @@
+# batch_divide_by_reference.py
+# --------------------------------------------
+# For every resampled TIFF in IN_DIR, compute:
+#   (target_band1) / (reference_band1)
+# Reference file: "Sea level rise 2020 ssp119_hist.tif"
+# Outputs go to OUT_DIR with suffix "_ratio_to_ssp119_hist.tif"
+# --------------------------------------------
+
+import os
+from pathlib import Path
+import numpy as np
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.warp import reproject
+from rasterio.windows import Window
+from tqdm import tqdm
+
+# ========== EDIT THESE PATHS ==========
+IN_DIR   = Path(r"Resampled files")  # folder with all resampled TIFFs
+OUT_DIR  = Path(r"Output folder ")       # where to save ratio tiffs
+REF_TIF  = Path(r"refernce tiff that you want to divide with one another")
+# =====================================
+
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def open_ref(ref_path: Path):
+    ref = rasterio.open(ref_path)
+    # Read reference band 1 fully
+    ref_arr = ref.read(1, masked=True)  # masked array using nodata
+    ref_meta = ref.meta.copy()
+    ref_nodata = ref.nodata
+    return ref, ref_arr, ref_meta, ref_nodata
+
+def align_to_ref(src_path: Path, ref_ds, ref_meta):
+    """Read src band1 and align (reproject/resample) to reference grid."""
+    with rasterio.open(src_path) as src:
+        # Prepare destination array aligned to reference shape/dtype
+        dst_arr = np.zeros((ref_meta['height'], ref_meta['width']), dtype=np.float32)
+        dst_arr[:] = np.nan
+
+        # Build reproject call
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst_arr,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=src.nodata,
+            dst_transform=ref_ds.transform,
+            dst_crs=ref_ds.crs,
+            dst_nodata=np.nan,
+            resampling=Resampling.nearest  # input is already resampled, so nearest is fine & fast
+        )
+        # Return as a masked array where NaN becomes masked
+        dst_mask = np.isnan(dst_arr)
+        return np.ma.array(dst_arr, mask=dst_mask)
+
+def divide_safe(num_ma, den_ma, den_nodata=None):
+    """Compute num/den with masking where denominator is nodata or zero."""
+    # Start with combined mask of any nodata
+    mask = np.ma.getmaskarray(num_ma) | np.ma.getmaskarray(den_ma)
+    den = den_ma.filled(np.nan)
+
+    # Also mask where denominator is 0 (avoid divide-by-zero)
+    zero_mask = (den == 0)
+    mask = mask | zero_mask
+
+    # Perform division
+    num = num_ma.filled(np.nan)
+    out = np.divide(num, den, where=~mask, out=np.full_like(num, np.nan, dtype=np.float32)).astype(np.float32)
+
+    # Return masked array
+    return np.ma.array(out, mask=mask)
+
+def main():
+    # --- Load reference once ---
+    if not REF_TIF.exists():
+        raise FileNotFoundError(f"Reference not found: {REF_TIF}")
+
+    ref_ds, ref_arr, ref_meta, ref_nodata = open_ref(REF_TIF)
+
+    # Normalize reference to float32 masked array
+    ref_arr = ref_arr.astype(np.float32)
+
+    # Collect candidate tiffs
+    tiffs = sorted([p for p in IN_DIR.glob("*.tif") if p.is_file()])
+
+    # Skip the reference file itself
+    tiffs = [p for p in tiffs if p.resolve() != REF_TIF.resolve()]
+
+    if not tiffs:
+        print("No TIFFs found to process in:", IN_DIR)
+        return
+
+    print(f"Reference: {REF_TIF.name}")
+    print(f"Found {len(tiffs)} tiffs to divide.\n")
+
+    for tif in tqdm(tiffs, desc="Dividing by reference", unit="file"):
+        try:
+            # Read/align numerator (current tif) to reference grid
+            num_ma = align_to_ref(tif, ref_ds, ref_meta)
+
+            # Ensure both are masked arrays float32
+            num_ma = num_ma.astype(np.float32)
+            den_ma = ref_arr  # already masked float32
+
+            # Compute safe ratio
+            ratio_ma = divide_safe(num_ma, den_ma, ref_nodata)
+
+            # Build output path
+            out_name = tif.stem + "_ratio_to_ssp119_hist.tif"
+            out_path = OUT_DIR / out_name
+
+            # Prepare output profile
+            profile = ref_meta.copy()
+            profile.update(
+                dtype="float32",
+                count=1,
+                compress="lzw",
+                tiled=True,
+                blockxsize=min(256, profile['width']),
+                blockysize=min(256, profile['height']),
+                BIGTIFF="IF_SAFER",
+                nodata=-9999.0
+            )
+
+            # Write
+            with rasterio.open(out_path, "w", **profile) as dst:
+                # Fill masked with nodata value
+                data_to_write = ratio_ma.filled(profile["nodata"])
+                dst.write(data_to_write, 1)
+
+            # Optional: copy over overviews can be added later if needed
+            # rasterio.shutil.copyfiles() is not required here.
+
+        except Exception as e:
+            print(f"\n[WARN] Failed on {tif.name}: {e}")
+
+    ref_ds.close()
+    print("\nDone! Outputs written to:", OUT_DIR)
+
+if __name__ == "__main__":
+    main()

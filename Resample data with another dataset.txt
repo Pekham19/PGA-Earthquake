@@ -1,0 +1,150 @@
+# batch_resample_to_reference_paths.py
+# -----------------------------------------------------------
+# Edit the PATHS section below (already filled with your paths), then run:
+#   python batch_resample_to_reference_paths.py
+# -----------------------------------------------------------
+
+# ============== PATHS (EDIT THESE IF NEEDED) ==============
+IN_DIR   = r"input file location"  # folder with rasters to resample
+REF_PATH = r"using the file you want to resample"  # reference raster
+OUT_DIR  = r"Out_put save file location"       # output folder
+METHOD   = "bilinear"   # choose: "nearest" (categorical) | "bilinear" | "cubic" | "cubic_spline" | "lanczos"
+OVERWRITE = True        # set False to skip files that already exist
+RECURSIVE = False       # set True to include subfolders
+# ==========================================================
+
+from pathlib import Path
+import numpy as np
+import rasterio
+from rasterio.warp import reproject, Resampling
+
+# Only interpolation methods (no min/max/average)
+RESAMPLING_MAP = {
+    "nearest": Resampling.nearest,       # categorical (classes)
+    "bilinear": Resampling.bilinear,     # continuous (default)
+    "cubic": Resampling.cubic,           # continuous
+    "cubic_spline": Resampling.cubic_spline,
+    "lanczos": Resampling.lanczos
+}
+
+def resample_to_match(src_path, ref_path, out_path, resampling="bilinear", compress="LZW"):
+    """
+    Reproject + resample src raster to EXACTLY match the reference raster's grid.
+    Interpolation only (nearest/bilinear/cubic/cubic_spline/lanczos).
+    """
+    src_path, ref_path, out_path = map(Path, (src_path, ref_path, out_path))
+    if resampling not in RESAMPLING_MAP:
+        raise ValueError(f"Invalid resampling '{resampling}'. Choose from {list(RESAMPLING_MAP)}")
+    resampling_enum = RESAMPLING_MAP[resampling]
+
+    # Reference grid
+    with rasterio.open(ref_path) as ref_ds:
+        dst_crs = ref_ds.crs
+        dst_transform = ref_ds.transform
+        dst_width = ref_ds.width
+        dst_height = ref_ds.height
+
+    with rasterio.open(src_path) as src_ds:
+        src_nodata = src_ds.nodata
+        src_dtype = src_ds.dtypes[0]
+        count = src_ds.count
+
+        # If using interpolating resampling on integer data, promote to float32
+        out_dtype = src_dtype
+        if resampling_enum in {Resampling.bilinear, Resampling.cubic,
+                               Resampling.cubic_spline, Resampling.lanczos} and \
+           np.issubdtype(np.dtype(src_dtype), np.integer):
+            out_dtype = "float32"
+
+        # Allocate destination array
+        dst = np.zeros((count, dst_height, dst_width), dtype=out_dtype)
+
+        # Reproject/resample band by band
+        for i in range(1, count + 1):
+            reproject(
+                source=rasterio.band(src_ds, i),
+                destination=dst[i - 1],
+                src_transform=src_ds.transform,
+                src_crs=src_ds.crs,
+                src_nodata=src_nodata,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                dst_nodata=src_nodata if np.issubdtype(np.dtype(out_dtype), np.number) else None,
+                resampling=resampling_enum,
+            )
+
+        # Output profile based on reference grid + source metadata
+        profile = src_ds.profile.copy()
+        profile.update(
+            driver="GTiff",
+            height=dst_height,
+            width=dst_width,
+            transform=dst_transform,
+            crs=dst_crs,
+            dtype=out_dtype,
+            count=count,
+            tiled=True,
+            # block sizes must be multiples of 16 to avoid RasterBlockError
+            blockxsize=256,
+            blockysize=256,
+            compress=compress if compress else None,
+            BIGTIFF="IF_SAFER",
+        )
+        # Set nodata sensibly
+        if np.dtype(out_dtype).kind == "f":
+            profile["nodata"] = np.nan if src_nodata is None else src_nodata
+        else:
+            profile["nodata"] = src_nodata
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with rasterio.open(out_path, "w", **profile) as dst_ds:
+            dst_ds.write(dst)
+
+def batch_resample_dir(in_dir, ref_path, out_dir, resampling="bilinear", overwrite=False, recursive=False):
+    """
+    Resample all .tif/.tiff in in_dir to match ref_path, writing to out_dir.
+    Skips the reference file itself if it lives in the input tree.
+    """
+    in_dir = Path(in_dir)
+    out_dir = Path(out_dir)
+    ref_path = Path(ref_path).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    patterns = ["*.tif", "*.tiff", "*.TIF", "*.TIFF"]  # handle mixed-case extensions
+    files = []
+    for pat in patterns:
+        files += list(in_dir.rglob(pat) if recursive else in_dir.glob(pat))
+    files = sorted(set(files))  # de-dup if multiple patterns matched same file
+
+    if not files:
+        print(f"No GeoTIFFs found in {in_dir} (recursive={recursive})")
+        return
+
+    for src in files:
+        if src.resolve() == ref_path:
+            print(f"Skip reference: {src.name}")
+            continue
+        # Preserve subfolder structure when recursive
+        rel = src.relative_to(in_dir) if recursive else src.name
+        out = out_dir / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        if out.exists() and not overwrite:
+            print(f"Skip (exists): {out}")
+            continue
+
+        print(f"Resampling {src} -> {out}")
+        try:
+            resample_to_match(src, ref_path, out, resampling=resampling)
+        except Exception as e:
+            print(f"FAILED: {src} | {e}")
+
+if __name__ == "__main__":
+    batch_resample_dir(
+        IN_DIR,
+        REF_PATH,
+        OUT_DIR,
+        resampling=METHOD,
+        overwrite=OVERWRITE,
+        recursive=RECURSIVE
+    )
